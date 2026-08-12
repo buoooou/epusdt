@@ -266,7 +266,11 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 		Amount:             amount,
 		BlockTransactionId: txHash,
 	}
-	err = OrderProcessing(req)
+	if chainNetwork == mdb.NetworkBsc {
+		err = ProcessDetectedOrderPayment(req, blockTsMs)
+	} else {
+		err = OrderProcessing(req)
+	}
 	if err != nil {
 		if errors.Is(err, constant.OrderBlockAlreadyProcess) || errors.Is(err, constant.OrderStatusConflict) {
 			log.Sugar.Infof("[%s-%s][%s] skip resolved trade_id=%s hash=%s err=%v", net, tokenSym, walletAddr, tradeID, txHash, err)

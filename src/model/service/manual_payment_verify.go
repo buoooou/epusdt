@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/config"
 	tron "github.com/GMWalletApp/epusdt/crypto"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
@@ -317,6 +318,12 @@ func ensureEvmTransactionNotBeforeOrder(blockTime uint64, order *mdb.Orders) err
 	}
 	if int64(blockTime)*1000 < order.CreatedAt.TimestampMilli() {
 		return fmt.Errorf("transaction predates the order")
+	}
+	if strings.EqualFold(order.Network, mdb.NetworkBsc) {
+		expiresAtMs := order.CreatedAt.StdTime().Add(config.GetOrderExpirationTimeDuration()).UnixMilli()
+		if int64(blockTime)*1000 > expiresAtMs {
+			return fmt.Errorf("transaction is after the order payment window")
+		}
 	}
 	return nil
 }

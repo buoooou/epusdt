@@ -17,7 +17,7 @@ import (
 	"github.com/GMWalletApp/epusdt/util/sign"
 )
 
-func TestProcessExpiredOrdersExpiresWaitingOrdersAndReleasesLocks(t *testing.T) {
+func TestProcessExpiredOrdersKeepsOnlyBscGraceLocks(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
 	defer cleanup()
 
@@ -29,7 +29,7 @@ func TestProcessExpiredOrdersExpiresWaitingOrdersAndReleasesLocks(t *testing.T) 
 		ActualAmount:   1,
 		ReceiveAddress: "wallet_1",
 		Token:          "USDT",
-		Network:        "tron",
+		Network:        mdb.NetworkBsc,
 		Status:         mdb.StatusWaitPay,
 		NotifyUrl:      "https://merchant.example/callback",
 	}
@@ -39,8 +39,28 @@ func TestProcessExpiredOrdersExpiresWaitingOrdersAndReleasesLocks(t *testing.T) 
 	if err := dao.Mdb.Model(order).UpdateColumn("created_at", time.Now().Add(-20*time.Minute)).Error; err != nil {
 		t.Fatalf("age expired order: %v", err)
 	}
-	if err := data.LockTransaction("tron", order.ReceiveAddress, order.Token, order.TradeId, order.ActualAmount, time.Hour); err != nil {
+	if err := data.LockTransaction(mdb.NetworkBsc, order.ReceiveAddress, order.Token, order.TradeId, order.ActualAmount, time.Hour); err != nil {
 		t.Fatalf("lock expired order: %v", err)
+	}
+	tronExpired := &mdb.Orders{
+		TradeId:        "trade_expired_tron",
+		OrderId:        "order_expired_tron",
+		Amount:         1,
+		Currency:       "CNY",
+		ActualAmount:   1.02,
+		ReceiveAddress: "wallet_1",
+		Token:          "USDT",
+		Network:        mdb.NetworkTron,
+		Status:         mdb.StatusWaitPay,
+	}
+	if err := dao.Mdb.Create(tronExpired).Error; err != nil {
+		t.Fatalf("create expired tron order: %v", err)
+	}
+	if err := dao.Mdb.Model(tronExpired).UpdateColumn("created_at", time.Now().Add(-20*time.Minute)).Error; err != nil {
+		t.Fatalf("age expired tron order: %v", err)
+	}
+	if err := data.LockTransaction(mdb.NetworkTron, tronExpired.ReceiveAddress, tronExpired.Token, tronExpired.TradeId, tronExpired.ActualAmount, time.Hour); err != nil {
+		t.Fatalf("lock expired tron order: %v", err)
 	}
 
 	recentOrder := &mdb.Orders{
@@ -71,12 +91,19 @@ func TestProcessExpiredOrdersExpiresWaitingOrdersAndReleasesLocks(t *testing.T) 
 	if expired.Status != mdb.StatusExpired {
 		t.Fatalf("expired order status = %d, want %d", expired.Status, mdb.StatusExpired)
 	}
-	lockTradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken("tron", order.ReceiveAddress, order.Token, order.ActualAmount)
+	lockTradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkBsc, order.ReceiveAddress, order.Token, order.ActualAmount)
 	if err != nil {
 		t.Fatalf("expired order lock lookup: %v", err)
 	}
-	if lockTradeID != "" {
-		t.Fatalf("expired order lock still exists: %s", lockTradeID)
+	if lockTradeID != order.TradeId {
+		t.Fatalf("expired order grace lock = %s, want %s", lockTradeID, order.TradeId)
+	}
+	tronLockTradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTron, tronExpired.ReceiveAddress, tronExpired.Token, tronExpired.ActualAmount)
+	if err != nil {
+		t.Fatalf("expired tron order lock lookup: %v", err)
+	}
+	if tronLockTradeID != "" {
+		t.Fatalf("expired tron order lock still exists: %s", tronLockTradeID)
 	}
 
 	recent, err := data.GetOrderInfoByTradeId(recentOrder.TradeId)

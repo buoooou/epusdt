@@ -169,9 +169,14 @@ func (c *BaseAdminController) MarkOrderPaid(ctx echo.Context) error {
 		log.Sugar.Warnf("[admin-order] mark-paid rejected admin_user_id=%d trade_id=%s block_transaction_id=%s err=%v", adminUserID, tradeID, req.BlockTransactionId, err)
 		return c.FailJson(ctx, err)
 	}
-	if order.Status != mdb.StatusWaitPay {
-		err = errors.New("order is not waiting payment")
+	if order.Status != mdb.StatusWaitPay && order.Status != mdb.StatusExpired {
+		err = errors.New("order is neither waiting payment nor expired")
 		log.Sugar.Warnf("[admin-order] mark-paid rejected admin_user_id=%d trade_id=%s status=%d block_transaction_id=%s err=%v", adminUserID, tradeID, order.Status, req.BlockTransactionId, err)
+		return c.FailJson(ctx, err)
+	}
+	if order.Status == mdb.StatusExpired && !strings.EqualFold(order.Network, mdb.NetworkBsc) {
+		err = errors.New("expired payment recovery is only supported for BSC orders")
+		log.Sugar.Warnf("[admin-order] mark-paid rejected admin_user_id=%d trade_id=%s network=%s block_transaction_id=%s err=%v", adminUserID, tradeID, order.Network, req.BlockTransactionId, err)
 		return c.FailJson(ctx, err)
 	}
 	if !isOnChainOrder(order.PayProvider) {
@@ -185,7 +190,7 @@ func (c *BaseAdminController) MarkOrderPaid(ctx echo.Context) error {
 		return c.FailJson(ctx, err)
 	}
 	req.BlockTransactionId = verifiedBlockTransactionID
-	err = service.OrderProcessing(&request.OrderProcessingRequest{
+	processingReq := &request.OrderProcessingRequest{
 		ReceiveAddress:     order.ReceiveAddress,
 		Currency:           order.Currency,
 		Token:              order.Token,
@@ -193,7 +198,12 @@ func (c *BaseAdminController) MarkOrderPaid(ctx echo.Context) error {
 		Amount:             order.ActualAmount,
 		TradeId:            order.TradeId,
 		BlockTransactionId: req.BlockTransactionId,
-	})
+	}
+	if order.Status == mdb.StatusExpired {
+		err = service.RecoverVerifiedOrderProcessing(processingReq)
+	} else {
+		err = service.OrderProcessing(processingReq)
+	}
 	if err != nil {
 		log.Sugar.Warnf("[admin-order] mark-paid processing failed admin_user_id=%d trade_id=%s block_transaction_id=%s err=%v", adminUserID, tradeID, req.BlockTransactionId, err)
 		return c.FailJson(ctx, err)

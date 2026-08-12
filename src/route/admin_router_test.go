@@ -715,6 +715,54 @@ func TestAdminOrders_MarkPaidSuccessAfterVerification(t *testing.T) {
 	}
 }
 
+func TestAdminOrders_MarkPaidRecoversExpiredOrderAfterVerification(t *testing.T) {
+	e, token := setupAdminTestEnv(t)
+	order := &mdb.Orders{
+		TradeId:        "trade-admin-recover-expired",
+		OrderId:        "order-admin-recover-expired",
+		Amount:         10,
+		Currency:       "CNY",
+		ActualAmount:   1.23,
+		ReceiveAddress: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Token:          "USDT",
+		Network:        mdb.NetworkBsc,
+		Status:         mdb.StatusExpired,
+		NotifyUrl:      "https://merchant.example/notify",
+		PayProvider:    mdb.PaymentProviderOnChain,
+	}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatalf("create expired order: %v", err)
+	}
+
+	restore := service.SetManualOrderPaymentValidatorForTest(func(got *mdb.Orders, blockID string) (string, error) {
+		if got.Status != mdb.StatusExpired {
+			t.Fatalf("validator status=%d, want expired", got.Status)
+		}
+		return "0xcanonical-expired-payment", nil
+	})
+	defer restore()
+
+	rec := doPostAdmin(e, "/admin/api/v1/orders/"+order.TradeId+"/mark-paid", map[string]interface{}{
+		"block_transaction_id": "0xexpired-payment",
+	}, token)
+	t.Logf("MarkOrderPaid expired recovery: status=%d body=%s", rec.Code, rec.Body.String())
+	assertOK(t, rec)
+
+	recovered, err := data.GetOrderInfoByTradeId(order.TradeId)
+	if err != nil {
+		t.Fatalf("reload recovered order: %v", err)
+	}
+	if recovered.Status != mdb.StatusPaySuccess {
+		t.Fatalf("status=%d, want paid", recovered.Status)
+	}
+	if recovered.CallBackConfirm != mdb.CallBackConfirmNo {
+		t.Fatalf("callback_confirm=%d, want pending callback", recovered.CallBackConfirm)
+	}
+	if recovered.BlockTransactionId != "0xcanonical-expired-payment" {
+		t.Fatalf("block_transaction_id=%q", recovered.BlockTransactionId)
+	}
+}
+
 func TestAdminOrders_MarkPaidRejectsVerificationFailure(t *testing.T) {
 	e, token := setupAdminTestEnv(t)
 	order := &mdb.Orders{

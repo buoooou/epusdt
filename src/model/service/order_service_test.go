@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/internal/testutil"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
@@ -522,6 +524,137 @@ func TestOrderProcessingSubOrderReturnsErrorWhenParentNotWaitPay(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when parent order is not wait-pay")
+	}
+
+	// Child and parent settlement is atomic: a parent-state conflict must not
+	// leave the child paid with no merchant callback destination.
+	subOrder, reloadErr := data.GetOrderInfoByTradeId(subResp.TradeId)
+	if reloadErr != nil {
+		t.Fatalf("reload sub-order: %v", reloadErr)
+	}
+	if subOrder.Status != mdb.StatusWaitPay || subOrder.BlockTransactionId != "" {
+		t.Fatalf("sub-order partially settled: status=%d block=%q", subOrder.Status, subOrder.BlockTransactionId)
+	}
+}
+
+func TestRecoverVerifiedSubOrderRevivesExpiredParentAndQueuesParentCallback(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	if _, err := data.AddWalletAddress("TTestTronAddress001"); err != nil {
+		t.Fatalf("add tron wallet: %v", err)
+	}
+	if _, err := data.AddWalletAddressWithNetwork(mdb.NetworkBsc, "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"); err != nil {
+		t.Fatalf("add bsc wallet: %v", err)
+	}
+
+	parentReq := newCreateTransactionRequest("order_expired_switch_recovery", 30)
+	parentReq.Network = mdb.NetworkTron
+	parentReq.PaymentType = mdb.PaymentTypeEpay
+	parentResp, err := CreateTransaction(parentReq, nil)
+	if err != nil {
+		t.Fatalf("create parent order: %v", err)
+	}
+
+	subResp, err := SwitchNetwork(&request.SwitchNetworkRequest{
+		TradeId: parentResp.TradeId,
+		Token:   "USDT",
+		Network: mdb.NetworkBsc,
+	})
+	if err != nil {
+		t.Fatalf("switch to bsc: %v", err)
+	}
+
+	if err = dao.Mdb.Model(&mdb.Orders{}).
+		Where("trade_id IN ?", []string{parentResp.TradeId, subResp.TradeId}).
+		Update("status", mdb.StatusExpired).Error; err != nil {
+		t.Fatalf("expire parent and sub-order: %v", err)
+	}
+
+	expiredSub, err := data.GetOrderInfoByTradeId(subResp.TradeId)
+	if err != nil {
+		t.Fatalf("load expired sub-order: %v", err)
+	}
+	blockTimestampMs := expiredSub.CreatedAt.StdTime().Add(time.Minute).UnixMilli()
+	err = ProcessDetectedOrderPayment(&request.OrderProcessingRequest{
+		ReceiveAddress:     subResp.ReceiveAddress,
+		Token:              subResp.Token,
+		Network:            subResp.Network,
+		TradeId:            subResp.TradeId,
+		Amount:             subResp.ActualAmount,
+		BlockTransactionId: "0xverified-bsc-payment",
+	}, blockTimestampMs)
+	if err != nil {
+		t.Fatalf("recover verified sub-order: %v", err)
+	}
+
+	parent, err := data.GetOrderInfoByTradeId(parentResp.TradeId)
+	if err != nil {
+		t.Fatalf("reload parent: %v", err)
+	}
+	subOrder, err := data.GetOrderInfoByTradeId(subResp.TradeId)
+	if err != nil {
+		t.Fatalf("reload sub-order: %v", err)
+	}
+	if parent.Status != mdb.StatusPaySuccess || parent.CallBackConfirm != mdb.CallBackConfirmNo {
+		t.Fatalf("parent recovery state: status=%d callback=%d", parent.Status, parent.CallBackConfirm)
+	}
+	if parent.NotifyUrl != parentReq.NotifyUrl || parent.OrderId != parentReq.OrderId {
+		t.Fatalf("merchant callback identity changed: order_id=%q notify_url=%q", parent.OrderId, parent.NotifyUrl)
+	}
+	if parent.PayBySubId != subOrder.ID {
+		t.Fatalf("parent pay_by_sub_id=%d, want %d", parent.PayBySubId, subOrder.ID)
+	}
+	if subOrder.Status != mdb.StatusPaySuccess || subOrder.CallBackConfirm != mdb.CallBackConfirmOk {
+		t.Fatalf("sub-order recovery state: status=%d callback=%d", subOrder.Status, subOrder.CallBackConfirm)
+	}
+	if subOrder.BlockTransactionId != "0xverified-bsc-payment" {
+		t.Fatalf("sub-order block_transaction_id=%q", subOrder.BlockTransactionId)
+	}
+}
+
+func TestProcessDetectedOrderPaymentRejectsTransferAfterExpiry(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	if _, err := data.AddWalletAddress("TTestTronAddress001"); err != nil {
+		t.Fatalf("add tron wallet: %v", err)
+	}
+	resp, err := CreateTransaction(newCreateTransactionRequest("order_late_transfer", 1), nil)
+	if err != nil {
+		t.Fatalf("create order: %v", err)
+	}
+	if err = dao.Mdb.Model(&mdb.Orders{}).
+		Where("trade_id = ?", resp.TradeId).
+		Update("status", mdb.StatusExpired).Error; err != nil {
+		t.Fatalf("expire order: %v", err)
+	}
+
+	order, err := data.GetOrderInfoByTradeId(resp.TradeId)
+	if err != nil {
+		t.Fatalf("load expired order: %v", err)
+	}
+	lateBlockTimestampMs := order.CreatedAt.StdTime().
+		Add(config.GetOrderExpirationTimeDuration() + time.Second).
+		UnixMilli()
+	err = ProcessDetectedOrderPayment(&request.OrderProcessingRequest{
+		ReceiveAddress:     resp.ReceiveAddress,
+		Token:              resp.Token,
+		Network:            mdb.NetworkTron,
+		TradeId:            resp.TradeId,
+		Amount:             resp.ActualAmount,
+		BlockTransactionId: "late-transfer",
+	}, lateBlockTimestampMs)
+	if !errors.Is(err, constant.OrderStatusConflict) {
+		t.Fatalf("late transfer error=%v, want status conflict", err)
+	}
+
+	unchanged, err := data.GetOrderInfoByTradeId(resp.TradeId)
+	if err != nil {
+		t.Fatalf("reload order: %v", err)
+	}
+	if unchanged.Status != mdb.StatusExpired || unchanged.BlockTransactionId != "" {
+		t.Fatalf("late transfer changed order: status=%d block=%q", unchanged.Status, unchanged.BlockTransactionId)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/internal/testutil"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/mdb"
@@ -126,6 +127,23 @@ func TestManualVerifyEvmRejectsTransactionBeforeOrder(t *testing.T) {
 	txTime = uint64(time.Now().Add(time.Minute).Unix())
 	if err := ensureEvmTransactionNotBeforeOrder(txTime, order); err != nil {
 		t.Fatalf("expected transaction after order to pass: %v", err)
+	}
+}
+
+func TestManualVerifyBscRejectsTransactionAfterPaymentWindow(t *testing.T) {
+	createdAt := time.Now().Add(-config.GetOrderExpirationTimeDuration() - time.Minute)
+	order := &mdb.Orders{
+		Network:   mdb.NetworkBsc,
+		BaseModel: mdb.BaseModel{CreatedAt: *carbon.NewTime(carbon.CreateFromTimestampMilli(createdAt.UnixMilli()))},
+	}
+	lateBlockTime := uint64(createdAt.Add(config.GetOrderExpirationTimeDuration() + time.Second).Unix())
+	if err := ensureEvmTransactionNotBeforeOrder(lateBlockTime, order); err == nil {
+		t.Fatal("expected BSC transaction after the payment window to be rejected")
+	}
+
+	inWindowBlockTime := uint64(createdAt.Add(time.Minute).Unix())
+	if err := ensureEvmTransactionNotBeforeOrder(inWindowBlockTime, order); err != nil {
+		t.Fatalf("expected BSC transaction inside the payment window to pass: %v", err)
 	}
 }
 

@@ -25,11 +25,20 @@ const (
 	CnyMinimumPaymentAmount  = 0.01
 	UsdtMinimumPaymentAmount = 0.01
 	IncrementalMaximumNumber = 100
+	// PaymentDetectionGracePeriod keeps only BSC amount reservations available
+	// for delayed confirmed events after the cashier timer expires. The canonical
+	// block timestamp is still checked, so transfers sent after expiry are denied.
+	PaymentDetectionGracePeriod = 5 * time.Minute
 )
 
 var (
 	gCreateTransactionLock sync.Mutex
 	gOrderProcessingLock   sync.Mutex
+)
+
+var (
+	waitPayStatuses        = []int{mdb.StatusWaitPay}
+	recoverPaymentStatuses = []int{mdb.StatusWaitPay, mdb.StatusExpired}
 )
 
 // apiKeyID safely extracts the primary key from an ApiKey row.
@@ -151,46 +160,99 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 
 // OrderProcessing marks an order as paid and releases its sqlite reservation.
 func OrderProcessing(req *request.OrderProcessingRequest) error {
+	return orderProcessing(req, waitPayStatuses, waitPayStatuses)
+}
+
+// RecoverVerifiedOrderProcessing repairs an order whose on-chain transfer was
+// missed before expiration. Callers must verify the transaction on chain
+// before using this function.
+func RecoverVerifiedOrderProcessing(req *request.OrderProcessingRequest) error {
+	order, err := data.GetOrderInfoByTradeId(req.TradeId)
+	if err != nil {
+		return err
+	}
+	if order.ID == 0 {
+		return constant.OrderNotExists
+	}
+	if !strings.EqualFold(order.Network, mdb.NetworkBsc) {
+		return constant.OrderStatusConflict
+	}
+	return orderProcessing(req, recoverPaymentStatuses, recoverPaymentStatuses)
+}
+
+// ProcessDetectedOrderPayment processes a transfer emitted by a chain
+// listener. If delivery was delayed until just after order expiration, the
+// order may be recovered only when the chain's block timestamp proves that the
+// customer sent the transfer during the original payment window.
+func ProcessDetectedOrderPayment(req *request.OrderProcessingRequest, blockTimestampMs int64) error {
+	order, err := data.GetOrderInfoByTradeId(req.TradeId)
+	if err != nil {
+		return err
+	}
+	if order.ID == 0 {
+		return constant.OrderNotExists
+	}
+	if !strings.EqualFold(order.Network, mdb.NetworkBsc) {
+		return OrderProcessing(req)
+	}
+	if blockTimestampMs <= 0 {
+		return constant.OrderStatusConflict
+	}
+	createdAtMs := order.CreatedAt.TimestampMilli()
+	expiresAtMs := order.CreatedAt.StdTime().Add(config.GetOrderExpirationTimeDuration()).UnixMilli()
+	if blockTimestampMs < createdAtMs || blockTimestampMs > expiresAtMs {
+		return constant.OrderStatusConflict
+	}
+	if order.Status == mdb.StatusExpired {
+		return RecoverVerifiedOrderProcessing(req)
+	}
+	return OrderProcessing(req)
+}
+
+func orderProcessing(req *request.OrderProcessingRequest, allowedStatuses, parentAllowedStatuses []int) error {
 	gOrderProcessingLock.Lock()
 	defer gOrderProcessingLock.Unlock()
 
-	tx := dao.Mdb.Begin()
-	exist, err := data.GetOrderByBlockIdWithTransaction(tx, req.BlockTransactionId)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	if exist.ID > 0 {
-		tx.Rollback()
-		return constant.OrderBlockAlreadyProcess
-	}
-
-	updated, err := data.OrderSuccessWithTransaction(tx, req)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	if !updated {
-		tx.Rollback()
-		return constant.OrderStatusConflict
-	}
-	if err = tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	if err = data.UnLockTransaction(req.Network, req.ReceiveAddress, req.Token, req.Amount); err != nil {
-		log.Sugar.Warnf("[order] unlock transaction after pay success failed, trade_id=%s, err=%v", req.TradeId, err)
-	}
-
-	// Load order to check parent-child relationship
+	// Load the relationship before changing any status. A switched-network
+	// child and its merchant-facing parent must be finalized atomically.
 	order, err := data.GetOrderInfoByTradeId(req.TradeId)
 	if err != nil {
-		return fmt.Errorf("load paid order failed, trade_id=%s: %w", req.TradeId, err)
+		return fmt.Errorf("load payment order failed, trade_id=%s: %w", req.TradeId, err)
+	}
+	if order.ID == 0 {
+		return constant.OrderNotExists
 	}
 
 	// Parent order paid directly: expire all sub-orders and release their locks
 	if order.ParentTradeId == "" {
+		tx := dao.Mdb.Begin()
+		exist, txErr := data.GetOrderByBlockIdWithTransaction(tx, req.BlockTransactionId)
+		if txErr != nil {
+			tx.Rollback()
+			return txErr
+		}
+		if exist.ID > 0 {
+			tx.Rollback()
+			return constant.OrderBlockAlreadyProcess
+		}
+		updated, txErr := data.OrderSuccessWithStatusesAndCallbackWithTransaction(tx, req, allowedStatuses, mdb.CallBackConfirmNo)
+		if txErr != nil {
+			tx.Rollback()
+			return txErr
+		}
+		if !updated {
+			tx.Rollback()
+			return constant.OrderStatusConflict
+		}
+		if txErr = tx.Commit().Error; txErr != nil {
+			tx.Rollback()
+			return txErr
+		}
+
+		if err = data.UnLockTransaction(req.Network, req.ReceiveAddress, req.Token, req.Amount); err != nil {
+			log.Sugar.Warnf("[order] unlock transaction after pay success failed, trade_id=%s, err=%v", req.TradeId, err)
+		}
+
 		subs, subErr := data.GetActiveSubOrders(order.TradeId)
 		if subErr != nil {
 			log.Sugar.Errorf("[order] get sub-orders for parent failed, trade_id=%s, err=%v", order.TradeId, subErr)
@@ -226,9 +288,33 @@ func OrderProcessing(req *request.OrderProcessingRequest) error {
 	}
 
 	finalizeTx := dao.Mdb.Begin()
+	exist, err := data.GetOrderByBlockIdWithTransaction(finalizeTx, req.BlockTransactionId)
+	if err != nil {
+		finalizeTx.Rollback()
+		return err
+	}
+	if exist.ID > 0 {
+		finalizeTx.Rollback()
+		return constant.OrderBlockAlreadyProcess
+	}
+
+	updatedChild, childErr := data.OrderSuccessWithStatusesAndCallbackWithTransaction(
+		finalizeTx,
+		req,
+		allowedStatuses,
+		mdb.CallBackConfirmOk,
+	)
+	if childErr != nil {
+		finalizeTx.Rollback()
+		return childErr
+	}
+	if !updatedChild {
+		finalizeTx.Rollback()
+		return constant.OrderStatusConflict
+	}
 
 	// Mark parent as paid with sub-order's payment details
-	updatedParent, markErr := data.MarkParentOrderSuccessWithTransaction(finalizeTx, parent.TradeId, order)
+	updatedParent, markErr := data.MarkParentOrderSuccessWithStatusesWithTransaction(finalizeTx, parent.TradeId, order, parentAllowedStatuses)
 	if markErr != nil {
 		finalizeTx.Rollback()
 		log.Sugar.Errorf("[order] mark parent success failed, parent_trade_id=%s, err=%v", parent.TradeId, markErr)
@@ -249,11 +335,8 @@ func OrderProcessing(req *request.OrderProcessingRequest) error {
 		return fmt.Errorf("commit parent finalize tx failed, parent_trade_id=%s: %w", parent.TradeId, err)
 	}
 
-	// Sub-order should not trigger its own callback (notify_url is empty).
-	// OrderSuccessWithTransaction unconditionally sets callback_confirm=No,
-	// reset it only after the parent order is successfully finalized.
-	if err = data.ResetCallbackConfirmOk(order.TradeId); err != nil {
-		log.Sugar.Warnf("[order] reset sub-order callback_confirm failed, trade_id=%s, err=%v", order.TradeId, err)
+	if err = data.UnLockTransaction(req.Network, req.ReceiveAddress, req.Token, req.Amount); err != nil {
+		log.Sugar.Warnf("[order] unlock transaction after sub-order pay success failed, trade_id=%s, err=%v", req.TradeId, err)
 	}
 
 	// Release parent's own wallet lock
@@ -281,11 +364,15 @@ func ReserveAvailableWalletAndAmount(tradeID string, network string, token strin
 	availableAddress := ""
 	availableAmount := amount
 	amountPrecision := data.GetAmountPrecision()
+	lockDuration := config.GetOrderExpirationTimeDuration()
+	if strings.EqualFold(network, mdb.NetworkBsc) {
+		lockDuration += PaymentDetectionGracePeriod
+	}
 
 	tryLockWalletFunc := func(targetAmount float64) (string, error) {
 		for _, address := range walletAddress {
 			normalizedAddress := normalizeOrderAddressByNetwork(network, address.Address)
-			err := data.LockTransaction(network, normalizedAddress, token, tradeID, targetAmount, config.GetOrderExpirationTimeDuration())
+			err := data.LockTransaction(network, normalizedAddress, token, tradeID, targetAmount, lockDuration)
 			if err == nil {
 				return normalizedAddress, nil
 			}
@@ -342,6 +429,12 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 
 	token := strings.ToUpper(strings.TrimSpace(req.Token))
 	network := strings.ToLower(strings.TrimSpace(req.Network))
+	// BSC switching and payment settlement share the same lifecycle lock. This
+	// prevents returning a new BSC address after the parent order has settled.
+	if network == mdb.NetworkBsc {
+		gOrderProcessingLock.Lock()
+		defer gOrderProcessingLock.Unlock()
+	}
 
 	// 1. Load parent order
 	parent, err := data.GetOrderInfoByTradeId(req.TradeId)
@@ -451,15 +544,29 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 		_ = data.UnLockTransactionByTradeId(subTradeID)
 		return nil, err
 	}
+	if network == mdb.NetworkBsc {
+		parentUpdated, updateErr := data.RefreshWaitingParentForSubOrderWithTransaction(tx, parent.TradeId)
+		if updateErr != nil {
+			tx.Rollback()
+			_ = data.UnLockTransactionByTradeId(subTradeID)
+			return nil, updateErr
+		}
+		if !parentUpdated {
+			tx.Rollback()
+			_ = data.UnLockTransactionByTradeId(subTradeID)
+			return nil, constant.OrderNotWaitPay
+		}
+	}
 	if err = tx.Commit().Error; err != nil {
 		tx.Rollback()
 		_ = data.UnLockTransactionByTradeId(subTradeID)
 		return nil, err
 	}
-
-	// Mark parent as selected and refresh its expiration to match the sub-order
-	_ = data.MarkOrderSelected(parent.TradeId)
-	_ = data.RefreshOrderExpiration(parent.TradeId)
+	if network != mdb.NetworkBsc {
+		// Preserve the existing behavior for every non-BSC network.
+		_ = data.MarkOrderSelected(parent.TradeId)
+		_ = data.RefreshOrderExpiration(parent.TradeId)
+	}
 
 	return buildCheckoutResponse(subOrder), nil
 }

@@ -160,13 +160,29 @@ func GetOrderByBlockTransactionIDsCaseInsensitive(blockIDs []string) (*mdb.Order
 
 // OrderSuccessWithTransaction marks an order as paid only if it is still waiting for payment.
 func OrderSuccessWithTransaction(tx *gorm.DB, req *request.OrderProcessingRequest) (bool, error) {
+	return OrderSuccessWithStatusesAndCallbackWithTransaction(
+		tx,
+		req,
+		[]int{mdb.StatusWaitPay},
+		mdb.CallBackConfirmNo,
+	)
+}
+
+// OrderSuccessWithStatusesAndCallbackWithTransaction marks an order as paid
+// only when its current status is explicitly allowed. callbackConfirm lets a
+// caller keep child orders out of the merchant callback queue while updating
+// the merchant-facing parent in the same transaction.
+func OrderSuccessWithStatusesAndCallbackWithTransaction(tx *gorm.DB, req *request.OrderProcessingRequest, allowedStatuses []int, callbackConfirm int) (bool, error) {
+	if len(allowedStatuses) == 0 {
+		return false, nil
+	}
 	result := tx.Model(&mdb.Orders{}).
 		Where("trade_id = ?", req.TradeId).
-		Where("status = ?", mdb.StatusWaitPay).
+		Where("status IN ?", allowedStatuses).
 		Updates(map[string]interface{}{
 			"block_transaction_id": req.BlockTransactionId,
 			"status":               mdb.StatusPaySuccess,
-			"callback_confirm":     mdb.CallBackConfirmNo,
+			"callback_confirm":     callbackConfirm,
 		})
 	return result.RowsAffected > 0, result.Error
 }
@@ -253,9 +269,19 @@ func MarkParentOrderSuccess(parentTradeId string, sub *mdb.Orders) (bool, error)
 // MarkParentOrderSuccessWithTransaction is the transactional variant of
 // MarkParentOrderSuccess.
 func MarkParentOrderSuccessWithTransaction(tx *gorm.DB, parentTradeId string, sub *mdb.Orders) (bool, error) {
+	return MarkParentOrderSuccessWithStatusesWithTransaction(tx, parentTradeId, sub, []int{mdb.StatusWaitPay})
+}
+
+// MarkParentOrderSuccessWithStatusesWithTransaction is used by verified
+// recovery flows as well as normal settlement. It preserves the merchant
+// order identity and queues the callback on the parent row.
+func MarkParentOrderSuccessWithStatusesWithTransaction(tx *gorm.DB, parentTradeId string, sub *mdb.Orders, allowedStatuses []int) (bool, error) {
+	if len(allowedStatuses) == 0 {
+		return false, nil
+	}
 	result := tx.Model(&mdb.Orders{}).
 		Where("trade_id = ?", parentTradeId).
-		Where("status = ?", mdb.StatusWaitPay).
+		Where("status IN ?", allowedStatuses).
 		Updates(map[string]interface{}{
 			"status":           mdb.StatusPaySuccess,
 			"callback_confirm": mdb.CallBackConfirmNo,
@@ -299,6 +325,20 @@ func RefreshOrderExpiration(tradeId string) error {
 	return dao.Mdb.Model(&mdb.Orders{}).
 		Where("trade_id = ?", tradeId).
 		Update("created_at", time.Now()).Error
+}
+
+// RefreshWaitingParentForSubOrderWithTransaction keeps the final parent-state
+// check and sub-order creation atomic. Paid or expired parents must never get a
+// new payment address.
+func RefreshWaitingParentForSubOrderWithTransaction(tx *gorm.DB, tradeId string) (bool, error) {
+	result := tx.Model(&mdb.Orders{}).
+		Where("trade_id = ?", tradeId).
+		Where("status = ?", mdb.StatusWaitPay).
+		Updates(map[string]interface{}{
+			"is_selected": true,
+			"created_at":  time.Now(),
+		})
+	return result.RowsAffected > 0, result.Error
 }
 
 // ResetCallbackConfirmOk sets callback_confirm back to Ok.
