@@ -259,34 +259,53 @@ func GetSiblingSubOrders(parentTradeId string, excludeTradeId string) ([]mdb.Ord
 }
 
 // MarkParentOrderSuccess marks the parent order as paid and records which sub-order
-// settled it. Only the status, callback_confirm, and pay_by_sub_id fields are updated;
-// the parent's own block_transaction_id, actual_amount, and receive_address are
-// intentionally left unchanged because the parent was not directly paid.
-func MarkParentOrderSuccess(parentTradeId string, sub *mdb.Orders) (bool, error) {
-	return MarkParentOrderSuccessWithTransaction(dao.Mdb, parentTradeId, sub)
+// settled it. It synchronizes the actual blockchain transaction details from the sub-order
+// onto the parent order so merchant callbacks and admin queries carry complete payment info.
+func MarkParentOrderSuccess(parentTradeId string, sub *mdb.Orders, blockTransactionId string) (bool, error) {
+	return MarkParentOrderSuccessWithTransaction(dao.Mdb, parentTradeId, sub, blockTransactionId)
 }
 
 // MarkParentOrderSuccessWithTransaction is the transactional variant of
 // MarkParentOrderSuccess.
-func MarkParentOrderSuccessWithTransaction(tx *gorm.DB, parentTradeId string, sub *mdb.Orders) (bool, error) {
-	return MarkParentOrderSuccessWithStatusesWithTransaction(tx, parentTradeId, sub, []int{mdb.StatusWaitPay})
+func MarkParentOrderSuccessWithTransaction(tx *gorm.DB, parentTradeId string, sub *mdb.Orders, blockTransactionId string) (bool, error) {
+	return MarkParentOrderSuccessWithStatusesWithTransaction(tx, parentTradeId, sub, blockTransactionId, []int{mdb.StatusWaitPay, mdb.StatusExpired})
 }
 
 // MarkParentOrderSuccessWithStatusesWithTransaction is used by verified
 // recovery flows as well as normal settlement. It preserves the merchant
-// order identity and queues the callback on the parent row.
-func MarkParentOrderSuccessWithStatusesWithTransaction(tx *gorm.DB, parentTradeId string, sub *mdb.Orders, allowedStatuses []int) (bool, error) {
+// order identity, populates the actual blockchain payment details, and
+// queues the callback on the parent row.
+func MarkParentOrderSuccessWithStatusesWithTransaction(tx *gorm.DB, parentTradeId string, sub *mdb.Orders, blockTransactionId string, allowedStatuses []int) (bool, error) {
 	if len(allowedStatuses) == 0 {
 		return false, nil
 	}
+	updates := map[string]interface{}{
+		"status":           mdb.StatusPaySuccess,
+		"callback_confirm": mdb.CallBackConfirmNo,
+		"pay_by_sub_id":    sub.ID,
+	}
+	if blockTransactionId != "" {
+		updates["block_transaction_id"] = blockTransactionId
+	} else if sub.BlockTransactionId != "" {
+		updates["block_transaction_id"] = sub.BlockTransactionId
+	}
+	if sub.ActualAmount > 0 {
+		updates["actual_amount"] = sub.ActualAmount
+	}
+	if sub.ReceiveAddress != "" {
+		updates["receive_address"] = sub.ReceiveAddress
+	}
+	if sub.Token != "" {
+		updates["token"] = sub.Token
+	}
+	if sub.Network != "" {
+		updates["network"] = sub.Network
+	}
+
 	result := tx.Model(&mdb.Orders{}).
 		Where("trade_id = ?", parentTradeId).
 		Where("status IN ?", allowedStatuses).
-		Updates(map[string]interface{}{
-			"status":           mdb.StatusPaySuccess,
-			"callback_confirm": mdb.CallBackConfirmNo,
-			"pay_by_sub_id":    sub.ID,
-		})
+		Updates(updates)
 	return result.RowsAffected > 0, result.Error
 }
 

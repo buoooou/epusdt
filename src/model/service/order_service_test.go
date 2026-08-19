@@ -967,4 +967,88 @@ func TestOrderProcessingSubOrderExpiresSiblingsAndReleasesLocks(t *testing.T) {
 	if ethLock != "" {
 		t.Fatalf("eth sub-order runtime lock still held: trade_id=%s", ethLock)
 	}
+
+	// Verify parent order updated with sub-order's payment details and queued callback
+	parentOrder, err := data.GetOrderInfoByTradeId(parentResp.TradeId)
+	if err != nil {
+		t.Fatalf("reload parent order: %v", err)
+	}
+	if parentOrder.Status != mdb.StatusPaySuccess {
+		t.Fatalf("parent status = %d, want %d (pay success)", parentOrder.Status, mdb.StatusPaySuccess)
+	}
+	if parentOrder.BlockTransactionId != "block_sib_eth" {
+		t.Fatalf("parent block_transaction_id = %q, want %q", parentOrder.BlockTransactionId, "block_sib_eth")
+	}
+	if parentOrder.ReceiveAddress != subEthResp.ReceiveAddress {
+		t.Fatalf("parent receive_address = %q, want %q", parentOrder.ReceiveAddress, subEthResp.ReceiveAddress)
+	}
+	if parentOrder.Network != mdb.NetworkEthereum {
+		t.Fatalf("parent network = %q, want %q", parentOrder.Network, mdb.NetworkEthereum)
+	}
+	if parentOrder.ActualAmount != subEthResp.ActualAmount {
+		t.Fatalf("parent actual_amount = %f, want %f", parentOrder.ActualAmount, subEthResp.ActualAmount)
+	}
+	if parentOrder.CallBackConfirm != mdb.CallBackConfirmNo {
+		t.Fatalf("parent callback_confirm = %d, want %d (pending callback)", parentOrder.CallBackConfirm, mdb.CallBackConfirmNo)
+	}
+}
+
+func TestOrderProcessingSubOrderPaidWhenParentExpired(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	if _, err := data.AddWalletAddress("TTestTronAddress001"); err != nil {
+		t.Fatalf("add tron wallet: %v", err)
+	}
+	if _, err := data.AddWalletAddressWithNetwork(mdb.NetworkBsc, "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"); err != nil {
+		t.Fatalf("add bsc wallet: %v", err)
+	}
+
+	parentReq := newCreateTransactionRequest("order_expired_parent_test", 1)
+	parentReq.Network = mdb.NetworkTron
+	parentResp, err := CreateTransaction(parentReq, nil)
+	if err != nil {
+		t.Fatalf("create parent order: %v", err)
+	}
+
+	subBscResp, err := SwitchNetwork(&request.SwitchNetworkRequest{
+		TradeId: parentResp.TradeId,
+		Token:   "usdt",
+		Network: mdb.NetworkBsc,
+	})
+	if err != nil {
+		t.Fatalf("switch to bsc sub-order: %v", err)
+	}
+
+	// Manually set parent order to Expired to simulate background timeout
+	if err := dao.Mdb.Model(&mdb.Orders{}).Where("trade_id = ?", parentResp.TradeId).Update("status", mdb.StatusExpired).Error; err != nil {
+		t.Fatalf("force expire parent: %v", err)
+	}
+
+	// Pay the BSC sub-order
+	err = OrderProcessing(&request.OrderProcessingRequest{
+		ReceiveAddress:     subBscResp.ReceiveAddress,
+		Token:              strings.ToUpper(subBscResp.Token),
+		Network:            strings.ToLower(subBscResp.Network),
+		TradeId:            subBscResp.TradeId,
+		Amount:             subBscResp.ActualAmount,
+		BlockTransactionId: "0xblock_bsc_expired_parent_payment",
+	})
+	if err != nil {
+		t.Fatalf("order processing bsc sub-order when parent expired: %v", err)
+	}
+
+	parentOrder, err := data.GetOrderInfoByTradeId(parentResp.TradeId)
+	if err != nil {
+		t.Fatalf("reload parent order: %v", err)
+	}
+	if parentOrder.Status != mdb.StatusPaySuccess {
+		t.Fatalf("parent status = %d, want %d (pay success)", parentOrder.Status, mdb.StatusPaySuccess)
+	}
+	if parentOrder.BlockTransactionId != "0xblock_bsc_expired_parent_payment" {
+		t.Fatalf("parent block_transaction_id = %q, want %q", parentOrder.BlockTransactionId, "0xblock_bsc_expired_parent_payment")
+	}
+	if parentOrder.CallBackConfirm != mdb.CallBackConfirmNo {
+		t.Fatalf("parent callback_confirm = %d, want %d (pending callback)", parentOrder.CallBackConfirm, mdb.CallBackConfirmNo)
+	}
 }

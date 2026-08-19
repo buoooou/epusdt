@@ -160,7 +160,7 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 
 // OrderProcessing marks an order as paid and releases its sqlite reservation.
 func OrderProcessing(req *request.OrderProcessingRequest) error {
-	return orderProcessing(req, waitPayStatuses, waitPayStatuses)
+	return orderProcessing(req, waitPayStatuses, recoverPaymentStatuses)
 }
 
 // RecoverVerifiedOrderProcessing repairs an order whose on-chain transfer was
@@ -199,7 +199,7 @@ func ProcessDetectedOrderPayment(req *request.OrderProcessingRequest, blockTimes
 		return constant.OrderStatusConflict
 	}
 	createdAtMs := order.CreatedAt.TimestampMilli()
-	expiresAtMs := order.CreatedAt.StdTime().Add(config.GetOrderExpirationTimeDuration()).UnixMilli()
+	expiresAtMs := order.CreatedAt.StdTime().Add(config.GetOrderExpirationTimeDuration() + PaymentDetectionGracePeriod).UnixMilli()
 	if blockTimestampMs < createdAtMs || blockTimestampMs > expiresAtMs {
 		return constant.OrderStatusConflict
 	}
@@ -314,7 +314,13 @@ func orderProcessing(req *request.OrderProcessingRequest, allowedStatuses, paren
 	}
 
 	// Mark parent as paid with sub-order's payment details
-	updatedParent, markErr := data.MarkParentOrderSuccessWithStatusesWithTransaction(finalizeTx, parent.TradeId, order, parentAllowedStatuses)
+	updatedParent, markErr := data.MarkParentOrderSuccessWithStatusesWithTransaction(
+		finalizeTx,
+		parent.TradeId,
+		order,
+		req.BlockTransactionId,
+		parentAllowedStatuses,
+	)
 	if markErr != nil {
 		finalizeTx.Rollback()
 		log.Sugar.Errorf("[order] mark parent success failed, parent_trade_id=%s, err=%v", parent.TradeId, markErr)
@@ -544,28 +550,21 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 		_ = data.UnLockTransactionByTradeId(subTradeID)
 		return nil, err
 	}
-	if network == mdb.NetworkBsc {
-		parentUpdated, updateErr := data.RefreshWaitingParentForSubOrderWithTransaction(tx, parent.TradeId)
-		if updateErr != nil {
-			tx.Rollback()
-			_ = data.UnLockTransactionByTradeId(subTradeID)
-			return nil, updateErr
-		}
-		if !parentUpdated {
-			tx.Rollback()
-			_ = data.UnLockTransactionByTradeId(subTradeID)
-			return nil, constant.OrderNotWaitPay
-		}
+	parentUpdated, updateErr := data.RefreshWaitingParentForSubOrderWithTransaction(tx, parent.TradeId)
+	if updateErr != nil {
+		tx.Rollback()
+		_ = data.UnLockTransactionByTradeId(subTradeID)
+		return nil, updateErr
+	}
+	if !parentUpdated {
+		tx.Rollback()
+		_ = data.UnLockTransactionByTradeId(subTradeID)
+		return nil, constant.OrderNotWaitPay
 	}
 	if err = tx.Commit().Error; err != nil {
 		tx.Rollback()
 		_ = data.UnLockTransactionByTradeId(subTradeID)
 		return nil, err
-	}
-	if network != mdb.NetworkBsc {
-		// Preserve the existing behavior for every non-BSC network.
-		_ = data.MarkOrderSelected(parent.TradeId)
-		_ = data.RefreshOrderExpiration(parent.TradeId)
 	}
 
 	return buildCheckoutResponse(subOrder), nil
